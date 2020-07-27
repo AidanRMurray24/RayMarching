@@ -60,6 +60,7 @@ public class RayTracingMaster : MonoBehaviour
         Graphics.Blit(_target, destination, _addMaterial);
         _currentSample++;
     }
+
     private void InitRenderTexture()
     {
         if (_target == null || _target.width != Screen.width || _target.height != Screen.height)
