@@ -1,0 +1,330 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+#define MAX_STEPS 100
+#define MAX_DIST 100
+#define SURF_DIST 1e-3
+
+Texture2D<float4> Source;
+RWTexture2D<float4> Result;
+float4x4 _CameraToWorld, _CameraInverseProjection;
+float3 _WorldSpaceCameraPos;
+int numShapes;
+
+struct Ray 
+{
+    float3 origin;
+    float3 direction;
+};
+
+struct LightData
+{
+    float3 position;
+    float3 direction;
+    float4 color;
+    int type;
+};
+StructuredBuffer<LightData> lightsBuffer;
+
+struct ShapeData {
+
+    float3 position;
+    float3 scale;
+    float3 colour;
+    int shapeType;
+    int operation;
+    float blendStrength;
+    int numChildren;
+};
+StructuredBuffer<ShapeData> shapesBuffer;
+
+
+Ray CreateRay(float3 origin, float3 direction) {
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv) {
+    float3 origin = mul(_CameraToWorld, float4(0, 0, 0, 1)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0, 1)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+float sdSphere(float3 pos, float3 centre, float radius)
+{
+    return distance(pos, centre) - radius;
+}
+
+float sdBox(float3 p, float3 centre, float3 scale)
+{
+    float3 o = abs(p - centre) - scale;
+    float ud = length(max(o, 0));
+    float n = max(max(min(o.x, 0), min(o.y, 0)), min(o.z, 0));
+    return ud + n;
+}
+
+float sdTorus(float3 p, float3 centre, float r1, float r2)
+{
+    float2 q = float2(length((p - centre).xz) - r1, p.y - centre.y);
+    return length(q) - r2;
+}
+
+float opUnion(float d1, float d2) { return min(d1, d2); }
+void opUnionColor(inout float d1, float d2, inout float3 colorA, float3 colorB)
+{
+    if (d2 < d1)
+    {
+        d1 = d2;
+        colorA = colorB;
+    }
+}
+
+float opSubtraction(float d1, float d2) { return max(-d1, d2); }
+void opSubtractionColor(inout float d1, float d2, inout float3 colorA, float3 colorB)
+{
+    if (-d2 > d1)
+    {
+        d1 = -d2;
+        colorA = colorB;
+    }
+}
+
+float opIntersection(float d1, float d2) { return max(d1, d2); }
+void opIntersectionColor(inout float d1, float d2, inout float3 colorA, float3 colorB)
+{
+    if (d2 > d1)
+    {
+        d1 = d2;
+        colorA = colorA;
+    }
+}
+
+float opSmoothUnion(float d1, float d2, float k) {
+    float h = clamp(0.5 + 0.5 * (d2 - d1) / k, 0.0, 1.0);
+    return lerp(d2, d1, h) - k * h * (1.0 - h);
+}
+void opSmoothUnionColor(inout float d1, float d2, inout float3 colorA, float3 colorB, float blendStrength)
+{
+    float h = clamp(0.5 + 0.5 * (d2 - d1) / blendStrength, 0.0, 1.0);
+    float blendDst = lerp(d2, d1, h) - blendStrength * h * (1.0 - h);
+    float3 blendCol = lerp(colorB, colorA, h);
+
+    d1 = blendDst;
+    colorA = blendCol;
+}
+
+float opSmoothSubtraction(float d1, float d2, float k) {
+    float h = clamp(0.5 - 0.5 * (d2 + d1) / k, 0.0, 1.0);
+    return lerp(d2, -d1, h) + k * h * (1.0 - h);
+}
+void opSmoothSubtractionColor(inout float d1, float d2, inout float3 colorA, float3 colorB, float blendStrength)
+{
+    /*float h = clamp(0.5 - 0.5 * (d2 + d1) / blendStrength, 0.0, 1.0);
+    float blendDst = lerp(d2, -d1, h) + blendStrength * h * (1.0 - h);
+    float3 blendCol = lerp(colorB, colorA, h);*/
+
+    float h = clamp(0.5 - 0.5 * (d2 + d1) / blendStrength, 0.0, 1.0);
+    float blendDst = lerp(d1, -d2, h) + blendStrength * h * (1.0 - h);
+    float3 blendCol = lerp(colorA, colorB, h);
+
+    d1 = blendDst;
+    colorA = blendCol;
+}
+
+float opSmoothIntersection(float d1, float d2, float k) {
+    float h = clamp(0.5 - 0.5 * (d2 - d1) / k, 0.0, 1.0);
+    return lerp(d2, d1, h) + k * h * (1.0 - h);
+}
+
+float GetShapeDist(ShapeData shape, float3 pos) 
+{
+
+    if (shape.shapeType == 0) {
+        return sdSphere(pos, shape.position, shape.scale.x);
+    }
+    else if (shape.shapeType == 1) {
+        return sdBox(pos, shape.position, shape.scale);
+    }
+    else if (shape.shapeType == 2) {
+        return sdTorus(pos, shape.position, shape.scale.x, shape.scale.y);
+    }
+
+    return MAX_DIST;
+}
+
+float4 Combine(float dstA, float dstB, float3 colorA, float3 colorB, int operation, float blendStrength) 
+{
+    // Set the distance and colour to the first distance and colour passed in
+    float dst = dstA;
+    float3 color = colorA;
+
+    // Calcualte the final distance and colour based on the operation
+    switch (operation)
+    {
+        case 0: // UNION
+        {
+            opUnionColor(dst, dstB, color, colorB);
+            break;
+        }
+        case 1: // SUBTRACTION
+        {
+            opSubtractionColor(dst, dstB, color, colorB);
+            break;
+        }
+        case 2: // INTERSECTION
+        {
+            opIntersectionColor(dst, dstB, color, colorB);
+            break;
+        }
+        case 3: // SMOOTH UNION
+        {
+            opSmoothUnionColor(dst, dstB, color, colorB, blendStrength);
+            break;
+        }
+        case 4: // SMOOTH SUBTRACTION
+        {
+            opSmoothSubtractionColor(dst, dstB, color, colorB, blendStrength);
+            break;
+        }
+        case 5: // SMOOTH INTERSECTION
+        {
+
+            break;
+        }
+    }
+
+    return float4(dst, color);
+}
+
+float4 GetSceneInfo(float3 pos)
+{
+    float dist = MAX_DIST;
+    float3 color = 1;
+
+    // Scene objects
+    for (int i = 0; i < numShapes; i++)
+    {
+        // Get the current shape and it's number of children
+        ShapeData shape = shapesBuffer[i];
+        int numChildren = shape.numChildren;
+
+        // Get the distance to the closest point on this shape and get the shape's colour
+        float localDst = GetShapeDist(shape, pos);
+        float3 localColour = shape.colour;
+
+
+        for (int j = 0; j < numChildren; j++)
+        {
+            // Get the current child shape of the shape
+            ShapeData childShape = shapesBuffer[i + j + 1];
+
+            // Get the distance to the closest point on this shape
+            float childDst = GetShapeDist(childShape, pos);
+
+            // Combine the parent and child shapes using their operators
+            float4 combined = Combine(localDst, childDst, localColour, childShape.colour, childShape.operation, childShape.blendStrength);
+
+            // Get the combined distance to the shape and colour
+            localDst = combined.r;
+            localColour = combined.gba;
+        }
+        i += numChildren; // Skip over children in outer loop
+
+        // Combine all the shapes with their operations
+        float4 globalCombined = Combine(dist, localDst, color, localColour, shape.operation, shape.blendStrength);
+
+        // Get the distance to the closest point of the combined shapes and the colour
+        dist = globalCombined.r;
+        color = globalCombined.gba;
+    }
+
+    return float4(dist, color);
+}
+
+float3 GetNormal(float3 pos)
+{
+    float2 e = float2(1e-2, 0);
+    float3 n = GetSceneInfo(pos).r - float3
+        (
+            GetSceneInfo(pos - e.xyy).r,
+            GetSceneInfo(pos - e.yxy).r,
+            GetSceneInfo(pos - e.yyx).r
+            );
+    return normalize(n);
+}
+
+float3 calculateDirectionalLight(float3 p, LightData data)
+{
+    // Direct diffuse light
+    float lightFalloff = max(0, dot(-data.direction, GetNormal(p)));
+    float3 directDiffuseLight = data.color.xyz * lightFalloff;
+
+    return directDiffuseLight;
+}
+
+float4 RayMarch(float3 ro, float3 rd)
+{
+    float dO = 0;   // Dist from origin
+    float dS;   // Dist from surface
+    float3 color;
+
+    // March the ray for a limited amount of steps
+    for (int i = 0; i < MAX_STEPS; i++)
+    {
+        // Calculate the current position
+        float3 p = ro + dO * rd;
+
+        // Get the distance to the scene
+        float4 sceneInfo = GetSceneInfo(p);
+        dS = sceneInfo.r;
+        color = sceneInfo.gba;
+        dO += dS;
+        if (dS<SURF_DIST || dO>MAX_DIST) break;
+    }
+
+    return float4(dO, color);
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // Get the UVs of the screen
+    uint width, height;
+    Result.GetDimensions(width, height);
+    float2 uv = id.xy / float2(width, height) * 2 - 1;
+
+    // Set the colour to the source render texture initially
+    float4 col = Source[id.xy];
+    Result[id.xy] = col;
+
+    // Calculate the ray origin and direction
+    Ray cameraRay = CreateCameraRay(uv);
+    float3 ro = cameraRay.origin;
+    float3 rd = cameraRay.direction;
+
+    // March the ray from the origin in the ray direction and retrieve the distance to the closest object hit
+    float4 rayMarch = RayMarch(ro, rd);
+    float dist = rayMarch.r;
+    float3 marchedColor = rayMarch.gba;
+
+    // If the distance was greater than or equal to the max dist then nothing was hit so return
+    if (dist >= MAX_DIST)
+        return;
+
+    // Get the point of intersection
+    float3 p = ro + rd * dist;
+
+    // Calculate lighting
+    float3 ambientLight = float3(0.2, 0.2, 0.2);
+    float3 diff = calculateDirectionalLight(p, lightsBuffer[0]) + ambientLight;
+
+    // Set the colour of the object to the diffuse light information
+    col.rgb = diff * marchedColor;
+
+    // Set the pixel of the final render texture to the color
+    Result[id.xy] = col;
+}

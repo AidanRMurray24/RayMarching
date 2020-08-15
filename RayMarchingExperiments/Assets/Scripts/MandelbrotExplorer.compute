@@ -1,0 +1,70 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+RWTexture2D<float4> Result;
+
+Texture2D<float4> ColorGradients;
+SamplerState samplerColorGradients;
+
+float2 texResolution;
+float4 area;
+float angle, color, repeat, time, speed, symmetry;
+
+float2 rot(float2 p, float2 pivot, float a)
+{
+    float s = sin(a);
+    float c = cos(a);
+
+    p -= pivot;
+    p = float2(p.x*c - p.y*s, p.x*s + p.y*c);
+    p += pivot;
+
+    return p;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = id.xy / texResolution.xy;
+    float2 newUV = (uv - .5);
+    newUV = abs(newUV);
+    //newUV = rot(newUV, 0, .25*3.1415);
+    //newUV = abs(newUV);
+
+    newUV = lerp((uv - .5), newUV, symmetry);
+
+    float2 c = area.xy + newUV *area.zw;
+    c = rot(c, area.xy, angle);
+
+    float r = 20.f; // Escape radius
+    float r2 = r * r;
+
+    float2 z, zPrevious;
+    float maxIter = 255.0f;
+    float iter;
+    for (iter = 0; iter < maxIter; iter++)
+    {
+        zPrevious = rot(z, 0, time);
+        z = float2(z.x * z.x - z.y * z.y, 2 * z.x * z.y) + c;
+        if (dot(z, zPrevious) > r2) break;
+    }
+    if (iter >= maxIter)
+    {
+        Result[id.xy] = 0;
+        return;
+    }
+
+    float dist = length(z); // Distance from origin
+    float fracIter = (dist - r) / (r2 - r); // Linear interpolation
+    fracIter = log2(log(dist) / log(r)); // Double exponential interpolation
+
+    float mandelbrotVal = sqrt(iter / maxIter);
+    float4 col = float4(sin(.3 * mandelbrotVal * 20), sin(.45 * mandelbrotVal * 20), sin(.65 * mandelbrotVal * 20), 1) *.5 + .5; // Procedural colours
+    col = ColorGradients.SampleLevel(samplerColorGradients, float2(mandelbrotVal * repeat + time * speed, color), 0);
+
+    float newAngle = atan2(z.x, z.y); // -pi and pi
+    col *= smoothstep(3, 0, fracIter);
+    col *= 1 + sin(newAngle * 2 + time * 4) * .2;
+
+    Result[id.xy] = col;
+}
