@@ -4,7 +4,6 @@
 #define MAX_STEPS 100
 #define MAX_DIST 100
 #define SURF_DIST 1e-3
-const float shadowBias = 5e-2;
 
 Texture2D<float4> Source;
 RWTexture2D<float4> Result;
@@ -23,6 +22,8 @@ struct LightData
     float3 position;
     float3 direction;
     float4 color;
+    float intensity;
+    float spotAngle;
     int type;
 };
 StructuredBuffer<LightData> lightsBuffer;
@@ -271,55 +272,95 @@ float4 RayMarch(float3 ro, float3 rd)
     return float4(dO, color);
 }
 
-float CalculateShadow(Ray ray, float dstToShadePoint)
+float CalculateShadows(in float3 ro, in float3 rd, float mint, float maxt)
 {
-    float rayDst = 0;
-    int marchSteps = 0;
-    float shadowIntensity = .2;
-    float brightness = 1;
-
-    while (rayDst < dstToShadePoint) {
-        marchSteps++;
-        float4 sceneInfo = GetSceneInfo(ray.origin);
-        float dst = sceneInfo.r;
-
-        if (dst <= SURF_DIST) {
-            return shadowIntensity;
-        }
-
-        brightness = min(brightness, dst * 200);
-
-        ray.origin += ray.direction * dst;
-        rayDst += dst;
+    for (float t = mint; t < maxt; )
+    {
+        float h = GetSceneInfo(ro + rd * t).r;
+        if (h < SURF_DIST)
+            return 0;
+        t += h;
     }
-    return shadowIntensity + (1 - shadowIntensity) * brightness;
+    return 1.0;
 }
 
-float3 GetLightColor(float3 p, LightData data)
+float3 CalculateDirectionalLight(float3 p, LightData light)
 {
-    // Direct diffuse light
-    float lightFalloff = max(0, dot(-data.direction, GetNormal(p)));
-    float3 directDiffuseLight = data.color.xyz * lightFalloff;
+    float3 normal = GetNormal(p);
 
-    // Set the ambient light
-    float3 ambientLight = float3(0.2, 0.2, 0.2);
-    directDiffuseLight;
+    // Calculate light falloff and colour
+    float lightFallOff = max(0, dot(-light.direction, normal) * light.intensity);
+    float3 lightColor = light.color.xyz * lightFallOff;
 
     // Calculate shadows
-    /*float3 offsetPos = p + GetNormal(p);
-    float4 rayMarch = RayMarch(offsetPos, -data.direction);
-    float d = rayMarch.r;
-    if (d < MAX_DIST)
-    {
-        directDiffuseLight *= ambientLight;
-    }*/
-    float3 offsetPos = p + GetNormal(p);
-    Ray ray;
-    ray.origin = offsetPos;
-    ray.direction = -data.direction;
-    float shadow = CalculateShadow(ray, MAX_DIST);
+    float shadow = CalculateShadows(p, -light.direction, 5e-2, MAX_DIST);
 
-    return directDiffuseLight * shadow;
+    return lightColor * shadow;
+}
+
+float3 CalculatePointLight(float3 p, LightData light)
+{
+    float3 normal = GetNormal(p);
+
+    // Calculate light falloff and colour
+    float3 lightDir = normalize(light.position - p);
+    float lightFallOff = max(0, dot(lightDir, normal) * light.intensity);
+    float3 lightColor = light.color.xyz * lightFallOff;
+
+    // Calculate shadows
+    float shadow = CalculateShadows(p, lightDir, 5e-2, MAX_DIST);
+
+    return lightColor * shadow;
+}
+
+float3 CalculateSpotLight(float3 p, LightData light)
+{
+    float3 normal = GetNormal(p);
+
+    float3 lightVec = normalize(light.position - p);
+    float cutOff = saturate(dot(-lightVec, light.direction));
+
+    float angle = light.spotAngle/2 * 3.1415f / 180.f;
+    if (cutOff < cos(angle))
+    {
+        return 0;
+    }
+
+    float lightFallOff = max(0, dot(lightVec, normal) * light.intensity);
+    float3 lightColor = light.color.xyz * lightFallOff;
+
+    // Calculate shadows
+    float shadow = CalculateShadows(p, lightVec, 5e-2, MAX_DIST);
+
+    return lightColor * shadow;
+}
+
+float3 GetLightColor(float3 p, LightData light)
+{
+    float3 finalColor = 0;
+    float3 ambientLight = float3(0.2, 0.2, 0.2);
+
+    // Get the light type
+    switch (light.type)
+    {
+        case 0: // SPOT
+        {
+            finalColor = CalculateSpotLight(p, light);
+            break;
+        }
+        case 1: // DIRECTIONAL
+        {
+            finalColor = CalculateDirectionalLight(p, light);
+            break;
+        }
+        case 2: // POINT
+        {
+            finalColor = CalculatePointLight(p, light);
+            break;
+        }
+    }
+
+    return finalColor + ambientLight;
 }
 
 [numthreads(8,8,1)]

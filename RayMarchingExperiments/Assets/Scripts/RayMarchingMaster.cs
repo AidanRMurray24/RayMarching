@@ -65,6 +65,9 @@ public class RayMarchingMaster : MonoBehaviour
         lightData[0].position = mainLight.transform.position;
         lightData[0].direction = mainLight.transform.forward;
         lightData[0].color = mainLight.color;
+        lightData[0].intensity = mainLight.intensity;
+        lightData[0].type = (int)mainLight.type;
+        lightData[0].spotAngle = mainLight.spotAngle;
 
         ComputeBuffer mainLightBuffer = new ComputeBuffer(lightData.Length, LightData.GetSize());
         mainLightBuffer.SetData(lightData);
