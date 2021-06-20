@@ -9,6 +9,9 @@ public class FractalTestMaster : MonoBehaviour
     [SerializeField] private ComputeShader shader = null;
     [SerializeField] private Light mainLight = null;
     [SerializeField] private float gloss = .5f;
+    [SerializeField] private uint iterations = 10;
+    [SerializeField] private float scale = 2f;
+    [SerializeField] private float blendStrength = 1f;
     private List<ComputeBuffer> buffersToDispose = null;
     private RenderTexture rt = null;
     private Camera cam = null;
@@ -46,6 +49,9 @@ public class FractalTestMaster : MonoBehaviour
         shader.SetMatrix("_CameraInverseProjection", cam.projectionMatrix.inverse);
         shader.SetVector("_WorldSpaceCameraPos", cam.transform.position);
         shader.SetFloat("_Gloss", gloss);
+        shader.SetFloat("_Scale", scale);
+        shader.SetFloat("_BlendStrength", blendStrength);
+        shader.SetInt("_Iterations", (int)iterations);
         shader.SetTexture(kernel, "Source", source);
         SetLightData();
     }

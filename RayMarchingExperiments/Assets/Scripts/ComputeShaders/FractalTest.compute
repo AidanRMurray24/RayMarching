@@ -9,7 +9,8 @@ Texture2D<float4> Source;
 RWTexture2D<float4> Result;
 float4x4 _CameraToWorld, _CameraInverseProjection;
 float3 _WorldSpaceCameraPos;
-float _Gloss;
+float _Gloss, _Scale, _BlendStrength;
+int _Iterations;
 
 struct LightData
 {
@@ -43,29 +44,95 @@ Ray CreateCameraRay(float2 uv) {
     return CreateRay(origin, direction);
 }
 
-float DistanceEstimator(float3 pos)
-{
-    /*pos.xz = pos.xz % 1.0 - float3(.5, .5, .5);
-    float dst = length(pos) - .3;
-    return dst;*/
+//Palette Creator
+float3 GetPaletteColor(in float t) {
+    //Palette
+    float3 PALETTE_BIAS = float3(.5, .5, .5);
+    float3 PALETTE_AMPLITUDE = float3(.5, .5, .5);
+    float3 PALETTE_FREQUENCIES = float3(1, .2, .3);
+    float3 PALETTE_OFFSET = float3(0, .15, .2);
+    float PALETTE_G_FREQUENCY = 1.f;
+    float PALETTE_G_OFFSET = .1f;
 
-    float Scale = 2;
-    float Offset = 1;
-    float3 z = pos;
-    float Iterations = 10;
-    float r;
-    int n = 0;
-    while (n < Iterations) {
-        if (z.x + z.y < 0) z.xy = -z.yx; // fold 1
-        if (z.x + z.z < 0) z.xz = -z.zx; // fold 2
-        if (z.y + z.z < 0) z.zy = -z.yz; // fold 3	
-        z = z * Scale - Offset * (Scale - 1.0);
-        n++;
-    }
-    return (length(z)) * pow(Scale, -float(n));
+    return PALETTE_BIAS + PALETTE_AMPLITUDE * cos(3.14 * ( PALETTE_G_FREQUENCY * PALETTE_FREQUENCIES * t + PALETTE_OFFSET + PALETTE_G_OFFSET));
+    //return float3(t,t,t);
 }
 
-float RayMarch(float3 ro, float3 rd)
+void opSmoothUnionColor(inout float d1, float d2, inout float3 colorA, float3 colorB, float blendStrength)
+{
+    float h = clamp(0.5 + 0.5 * (d2 - d1) / blendStrength, 0.0, 1.0);
+    float blendDst = lerp(d2, d1, h) - blendStrength * h * (1.0 - h);
+    float3 blendCol = lerp(colorB, colorA, h);
+
+    d1 = blendDst;
+    colorA = blendCol;
+}
+
+float sdTetrahedron(float3 p)
+{
+    return 
+        (
+            max
+            (
+                max(-p.x - p.y - p.z, p.x + p.y - p.z),
+                max(-p.x + p.y + p.z, p.x - p.y + p.z)
+            )
+            - 1.
+        ) / sqrt(3.0);
+}
+
+float2 SierpinskiTetrahedron(float3 z) 
+{
+    float3 n1 = normalize(float3(1, 1, 0));
+    float3 n2 = normalize(float3(1, 0, 1));
+    float3 n3 = normalize(float3(0, 1, 1));
+
+    float s = 1.;
+    float orbit = 1e20;
+    for (int n = 0; n < _Iterations; n++) {
+        orbit = min(orbit, dot(z, z));
+
+        //tetrahedron folding
+        z -= 2. * min(0., dot(z, n1)) * n1;
+        z -= 2. * min(0., dot(z, n2)) * n2;
+        z -= 2. * min(0., dot(z, n3)) * n3;
+
+        //scaling
+        z = z * _Scale - 1.;
+        s /= _Scale;
+    }
+    //dis & descale
+    return float2(sdTetrahedron(z) * s, orbit);
+}
+
+float4 DistanceEstimator(float3 pos)
+{
+    float plane = pos.y - 0;
+
+    // Translate
+    pos.y -= 1;
+    float2 fractal = SierpinskiTetrahedron(pos);
+
+    //float dst = min(fractal.x, plane);
+    float dst = fractal.x;
+    float3 color = GetPaletteColor(fractal.y);
+    /*if (fractal.x < plane)
+    {
+        dst = fractal.x;
+        color = GetPaletteColor(fractal.y);
+    }
+    else
+    {
+        dst = plane;
+        color = float3(.9, .9, .9);
+    }*/
+
+    opSmoothUnionColor(dst, plane, color, float3(.9, .9, .9), _BlendStrength);
+
+    return float4(dst, color);
+}
+
+float2 RayMarch(float3 ro, float3 rd)
 {
     float dO = 0;   // Dist from origin
     float dS;   // Dist from surface
@@ -78,33 +145,45 @@ float RayMarch(float3 ro, float3 rd)
         float3 p = ro + dO * rd;
 
         // Get the distance to the scene
-        float DE = DistanceEstimator(p);
+        float DE = DistanceEstimator(p).x;
         dS = DE;
         dO += dS;
-        if (dS<SURF_DIST /*|| dO>MAX_DIST*/) break;
+        if (dS<SURF_DIST || dO>MAX_DIST) break;
     }
 
-    //return dO;
-    return 1.0 - float(i) / float(MAX_STEPS);
+    return float2(dO, 1.0 - float(i) / float(MAX_STEPS));
 }
 
 float3 GetNormal(float3 pos)
 {
     float2 e = float2(SURF_DIST, 0);
-    float3 n = DistanceEstimator(pos) - float3
+    float3 n = DistanceEstimator(pos).x - float3
         (
-            DistanceEstimator(pos - e.xyy),
-            DistanceEstimator(pos - e.yxy),
-            DistanceEstimator(pos - e.yyx)
+            DistanceEstimator(pos - e.xyy).x,
+            DistanceEstimator(pos - e.yxy).x,
+            DistanceEstimator(pos - e.yyx).x
             );
     return normalize(n);
 }
+
+//float CalculateAO(float3 p)
+//{
+//    float sum = 0.f;
+//    float k = 2.f;
+//
+//    for (int i = 0; i < 5; i++)
+//    {
+//        sum += 1 / (pow(2, i)) * ();
+//    }
+//
+//    return 1 - k * sum;
+//}
 
 float CalculateShadows(in float3 ro, in float3 rd, float mint, float maxt)
 {
     for (float t = mint; t < maxt; )
     {
-        float h = DistanceEstimator(ro + rd * t);
+        float h = DistanceEstimator(ro + rd * t).x;
         if (h < SURF_DIST)
             return 0;
         t += h;
@@ -142,9 +221,9 @@ float3 CalculateDirectionalLight(float3 p, LightData light)
     float3 specular = CalculateBlinnPhongSpecular(p, GetNormal(p), -light.direction) * lightColor;
 
     // Calculate shadows
-    //float shadow = CalculateShadows(p, -light.direction, 1, MAX_DIST);
+    float shadow = CalculateShadows(p, -light.direction, 5e-2, MAX_DIST);
 
-    return saturate(lightColor + specular);
+    return saturate(lightColor + specular) * shadow;
 }
 
 float3 CalculatePointLight(float3 p, LightData light)
@@ -229,8 +308,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     float3 rd = cameraRay.direction;
 
     // March the ray from the origin in the ray direction and retrieve the distance to the closest object hit
-    float rayMarch = RayMarch(ro, rd);
-    float dist = rayMarch;
+    float2 rayMarch = RayMarch(ro, rd);
+    float dist = rayMarch.x;
 
     // If the distance was greater than or equal to the max dist then nothing was hit so return
     if (dist >= MAX_DIST)
@@ -239,8 +318,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // Get the point of intersection
     float3 p = ro + rd * dist;
     float3 normal = GetNormal(p);
-    //col.rgb = GetLightColor(p, lightsBuffer[0]);
-    col.rbga = dist;
+    col.rgb = GetLightColor(p, lightsBuffer[0]) * rayMarch.y * DistanceEstimator(p).gba;
+    //col.rbga = dist;
 
     // Set the pixel of the final render texture to the color
     Result[id.xy] = col;

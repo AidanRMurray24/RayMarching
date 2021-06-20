@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using UnityEngine;
 
+[ExecuteAlways, ImageEffectAllowedInSceneView]
 public class RayTracingMaster : MonoBehaviour
 {
     public ComputeShader shader;
